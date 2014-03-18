@@ -24,6 +24,7 @@ sub ping_target($);
 sub get_ips_from_block($);
 sub get_snmp_oid($$);
 sub open_snmp_session($$$);
+sub verify_cidr($);
 
 Readonly our $COUNT              => 'COUNT';
 Readonly our $SNMPV1             => 'snmpv1';
@@ -99,14 +100,14 @@ $file_CIDR = $opt_C;
 # Open SNMP File
 #
 # ----------------------
-print "Open SNMP\n";
+print "Open SNMP\n" if $DEBUG;
 open( SNMP, $file_SNMP ) || die "Unable to open SNMP File: '$file_SNMP'\n";
 while (<SNMP>) {
     chop;
     my $snmp = $_;
     push( @SNMP, $snmp );
 
-    # print "Adding SNMP String: '$snmp'\n" if $DEBUG;
+    print "Adding SNMP String: '$snmp'\n" if $DEBUG or $VERBOSE;
 
 }
 close SNMP;
@@ -121,11 +122,16 @@ while (<CIDR>) {
     chop;
     my $cidr = $_;
 
-    # print "Adding CIDR Block: '$cidr'\n" if $DEBUG;
+    print "Adding CIDR Block: '$cidr'\n" if $DEBUG;
+
+    if ( !verify_cidr($cidr) ) {
+        print "BAD CIDR: '$cidr', SKIPPING\n" if $VERBOSE;
+        next;
+    }
 
     foreach my $ip ( get_ips_from_block($cidr) ) {
 
-        # print "\t$ip\n" if $DEBUG;
+        print "\t$ip\n" if $DEBUG;
 
         if ( !defined $SCANIP{$ip} ) {
             my %h;
@@ -142,21 +148,36 @@ while (<CIDR>) {
 }
 close CIDR;
 
+print "Using " . scalar( keys(%SCANIP) ) . " IP Addresses\n" if $VERBOSE;
+
+if ($DRYRUN) {
+    exit;
+}
+
+# ----------------------
+# Scan the IPs
+#
+# ----------------------
 foreach my $ip ( sort( keys(%SCANIP) ) ) {
     my $snmp_ver;
     my $snmp_string;
     my $ipref = $SCANIP{$ip};
 
+    print "$ip: " if $VERBOSE;
+
     if ( !ping_target($ip) ) {
-        print "SKIP $ip\n" if $DEBUG;
+        print "SKIP\n" if $VERBOSE;
         next;
     }
     else {
+        print "\n"                       if $VERBOSE;
         print "PINGABLE $ip, continue\n" if $DEBUG;
     }
 
     foreach my $v (@SNMPVER) {
         $snmp_ver = $v;
+
+        print "\tSNMP VER: $v\n" if $VERBOSE;
 
         foreach my $s (@SNMP) {
             my $session;
@@ -166,14 +187,17 @@ foreach my $ip ( sort( keys(%SCANIP) ) ) {
             my $sysuptime;
             $snmp_string = $s;
 
+            print "\t\tSNMP STR: $s\n" if $VERBOSE;
+
             if ( defined( $session = open_snmp_session( $ip, $snmp_string, $snmp_ver ) ) ) {
                 my $result_ref;
 
                 #
-                # IF THE FIRST QUERY MISSES, SKIP THE REST AND GO TO THE NEXT STRING
+                # IF THE FIRST QUERY MISSES, SKIP THE REST AND GO TO THE NEXT STRING/VER
                 #
                 if ( !( $result_ref = get_snmp_oid( $session, $SNMP_OID_SYSNAME ) ) ) {
-                    print "SYSNAME: Unknown\n" if $DEBUG;
+                    print "SYSNAME: Unknown\n"  if $DEBUG;
+                    print "\t\t\tNO RESPONSE\n" if $VERBOSE;
                     next;
                 }
                 $sysname = $result_ref->{$SNMP_OID_SYSNAME};
@@ -221,6 +245,9 @@ foreach my $ip ( sort( keys(%SCANIP) ) ) {
     }
 }
 
+# ---------------------------
+# Output Section
+# ---------------------------
 foreach my $ip ( sort { $a <=> $b } ( keys(%SCANIP) ) ) {
     if ( $SCANIP{$ip}->{$SNMPREADY} ) {
         my $ipref       = $SCANIP{$ip};
@@ -297,11 +324,67 @@ sub ping_target($) {
 }
 
 #----------------------------------------------------------------
+sub verify_cidr($) {
+    my ($cidr) = @_;
+    my $ret = 0;
+    my ( $a, $b, $c, $d, $mask );
+
+    if ( $cidr =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)/ ) {
+        $a    = $1;
+        $b    = $2;
+        $c    = $3;
+        $d    = $4;
+        $mask = $5;
+    }
+    elsif ( $cidr =~ /^(\d+)\.(\d+)\.(\d+)\.(\d+)/ ) {
+        $a    = $1;
+        $b    = $2;
+        $c    = $3;
+        $d    = $4;
+        $mask = 32;
+    }
+    else {
+        print "BAD CIDR:$cidr\n" if $DEBUG or $VERBOSE;
+        return $ret;
+    }
+
+    if ( $a > 0 && $a < 239 ) {
+        if ( $b >= 0 && $b < 256 ) {
+            if ( $c >= 0 && $c < 256 ) {
+                if ( $d >= 0 && $d < 256 ) {
+                    if ( $mask > 16 && $mask < 33 ) {
+                        $ret = 1;
+                    }
+                    else {
+                        print "CIDR:$cidr -> BAD MASK: $mask\n" if $DEBUG or $VERBOSE;
+                    }
+                }
+                else {
+                    print "CIDR:$cidr -> FOURTH OCTET OUT OF RANGE: $d\n" if $DEBUG or $VERBOSE;
+                }
+            }
+            else {
+                print "CIDR:$cidr -> THIRD OCTET OUT OF RANGE: $c\n" if $DEBUG or $VERBOSE;
+            }
+        }
+        else {
+            print "CIDR:$cidr -> SECOND OCTET OUT OF RANGE: $b\n" if $DEBUG or $VERBOSE;
+        }
+    }
+    else {
+        print "CIDR:$cidr -> FIRST OCTET OUT OF RANGE: $a\n" if $DEBUG or $VERBOSE;
+    }
+
+    $ret;
+}
+
+#----------------------------------------------------------------
 sub print_usage {
     print "$progname [options]\n";
     print "\tOptions:\n";
     print "\t-C File of CIDRs to scan\n";
     print "\t-S File of SNMP Strings to use\n";
+    print "\t-v Be Verbose\n";
     print "\t-V print version info\n";
     print "\t-h print this message\n";
     print "\t-n Dry Run, dont do anything\n";
